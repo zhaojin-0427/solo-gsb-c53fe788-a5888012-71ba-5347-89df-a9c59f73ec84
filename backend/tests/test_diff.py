@@ -7,6 +7,11 @@
 * 变量赋值差异 -> variables 见证；终态差异 -> terminal 见证；
 * 外部效果差异（幂等开关/效果键）-> effects 见证；
 * 共同自定义不变量的结论翻转 -> invariant 见证；仅一侧启用的不变量进入配置差异；
+* **单侧独有事件后的续跑枚举**：基线无确认后崩溃、候选启用非幂等应答丢失时，
+  独有恢复事件之后的重调（retry_timeout_duplicate）、重复生效与「至多一次生效」
+  不变量翻转必须进入报告（旧实现只看独有事件下一步即停止该侧，会漏检并可能
+  仍声称完备）；续跑见证对齐索引连续、另一侧持留、分叉标记只在首个独有步、
+  续跑在步数边界截断时明确标注未完备（diff_found_incomplete）；
 * 步数边界截断 -> inconclusive 且 incompleteness 非空（结果未完备标注）；
 * 见证步骤的对齐索引连续、两侧长度在分叉步对齐；
 * 从差异节点分叉复检（/api/diff/fork）、对比记录持久化、按记录打开（含快照）；
@@ -216,6 +221,119 @@ class DiffCoreTests(unittest.TestCase):
         self.assertEqual(r["verdict"], "diff_found_incomplete")
         self.assertIn("variables", r["witnesses"])
         self.assertTrue(r["stats"]["truncated"])
+
+
+def _post_crash_pair():
+    """基线：pay 不会确认后崩溃；候选：pay 启用应答丢失且非幂等。"""
+    base = _chain(effects=("pay", "ship"))
+    cand = _chain(effects=("pay", "ship"))
+    cand["activities"][0].update(post_crash=True, idempotent=False)
+    return W.compile_workflow(base), W.compile_workflow(cand)
+
+
+class DiffContinuationTests(unittest.TestCase):
+    """独有事件之后该侧继续枚举：重调、重复生效、终态/不变量变化不漏检。"""
+
+    def test_retry_duplicate_after_unique_crash_enters_report(self):
+        wb, wc = _post_crash_pair()
+        r = D.run_diff(wb, wc, bound=12)
+        self.assertEqual(r["verdict"], "diff_found")
+        self.assertFalse(r["stats"]["truncated"])
+        # 「至多一次生效」必须经由独有事件之后的续跑检出（旧实现会漏）
+        self.assertIn("invariant", r["witnesses"])
+        w = r["witnesses"]["invariant"]
+        self.assertTrue(w.get("via_divergence"))
+        self.assertEqual(w["side"], "candidate")
+        self.assertTrue(w["continuation"])
+        self.assertEqual(w["continuation_steps"], 1)
+        # 候选轨迹：独有「应答丢失重调 retry」->「retry_timeout_duplicate」
+        c_types = [s["event"]["type"] for s in w["candidate_steps"] if s["event"]]
+        self.assertEqual(c_types, ["retry", "retry_timeout_duplicate"])
+        self.assertEqual(w["candidate_steps"][1]["divergence"], True)
+        self.assertNotIn("divergence", w["candidate_steps"][2])
+        self.assertTrue(w["candidate_steps"][-1]["diff_point"])
+        # 变化内容：至多一次生效，基线成立、候选被破坏
+        ch = w["changes"][0]
+        self.assertEqual(ch["id"], "at_most_once")
+        self.assertEqual((ch["base_violated"], ch["candidate_violated"]), (False, True))
+        # 候选末态存在两条未撤销 pay 效果（重复），基线持留状态没有效果
+        effs = w["candidate_steps"][-1]["snapshot"]["effects"]
+        self.assertEqual(sum(1 for e in effs if not e["undone"]), 2)
+        self.assertTrue(any(e["duplicate"] for e in effs))
+
+    def test_continuation_witness_columns_aligned_with_holds(self):
+        wb, wc = _post_crash_pair()
+        r = D.run_diff(wb, wc, bound=12)
+        w = r["witnesses"]["invariant"]
+        # 两侧步数相同，对齐索引连续；独有步及后续步基线均持留
+        self.assertEqual(len(w["baseline_steps"]), len(w["candidate_steps"]))
+        n = len(w["candidate_steps"])
+        self.assertEqual([s["align_index"] for s in w["candidate_steps"]], list(range(n)))
+        self.assertEqual([s["align_index"] for s in w["baseline_steps"]], list(range(n)))
+        for i in (1, 2):
+            self.assertTrue(w["baseline_steps"][i]["hold"])
+            self.assertIsNone(w["baseline_steps"][i]["event"])
+            self.assertFalse(w["candidate_steps"][i].get("hold"))
+        # 独有步分叉标记只在触发侧、且只标一次
+        self.assertTrue(w["candidate_steps"][w["diverge_index"]]["divergence"])
+        self.assertFalse(w["candidate_steps"][w["diverge_index"] + 1].get("divergence"))
+
+    def test_immediate_effects_change_is_one_step_divergence_witness(self):
+        # recover_acknowledged 在独有步即产生效果差异（长度 1，非续跑见证）
+        wb, wc = _post_crash_pair()
+        r = D.run_diff(wb, wc, bound=12)
+        self.assertIn("effects", r["witnesses"])
+        w = r["witnesses"]["effects"]
+        self.assertTrue(w.get("via_divergence"))
+        self.assertFalse(w["continuation"])
+        self.assertEqual(w["continuation_steps"], 0)
+        self.assertEqual(w["length"], 1)
+
+    def test_bare_divergence_witness_unchanged(self):
+        wb, wc = _post_crash_pair()
+        r = D.run_diff(wb, wc, bound=12)
+        d = r["divergence"]
+        self.assertEqual(d["kind"], "divergence")
+        self.assertEqual(d["side"], "candidate")
+        self.assertEqual(d["diverge_index"], 1)
+        self.assertEqual(len(d["baseline_steps"]), len(d["candidate_steps"]))
+        self.assertTrue(d["candidate_steps"][1]["divergence"])
+        self.assertTrue(d["baseline_steps"][1]["hold"])
+        self.assertFalse(d.get("continuation"))
+
+    def test_baseline_side_continuation_also_enumerated(self):
+        # 反向：基线启用非幂等应答丢失，候选不启用 -> 不变量见证在基线侧
+        wc, wb = _post_crash_pair()
+        r = D.run_diff(wb, wc, bound=12)
+        w = r["witnesses"]["invariant"]
+        self.assertEqual(w["side"], "baseline")
+        b_types = [s["event"]["type"] for s in w["baseline_steps"] if s["event"]]
+        self.assertEqual(b_types, ["retry", "retry_timeout_duplicate"])
+        self.assertTrue(all(w["candidate_steps"][i]["hold"] for i in (1, 2)))
+
+    def test_continuation_bound_truncation_marked_incomplete(self):
+        # bound=2：独有步（深度1）+续跑一步（深度2）恰好发现重复，但续跑之后
+        # 仍有可展开状态（b 尚未成功），必须标注未完备，不能声称搜索已完备。
+        wb, wc = _post_crash_pair()
+        r = D.run_diff(wb, wc, bound=2)
+        self.assertEqual(r["verdict"], "diff_found_incomplete")
+        self.assertTrue(r["stats"]["truncated"])
+        self.assertTrue(r["stats"]["continuation_bound_reached"])
+        self.assertTrue(r["incompleteness"])
+        self.assertTrue(any("步数边界" in t for t in r["incompleteness"]))
+        # 即使截断，步数内的重复生效仍被检出
+        self.assertIn("invariant", r["witnesses"])
+
+    def test_same_bound_used_for_both_search_phases(self):
+        # 单侧续跑与对齐展开始终共用同一步数上限：统计中两侧续跑都在 bound 内
+        wb, wc = _post_crash_pair()
+        r = D.run_diff(wb, wc, bound=3)
+        self.assertEqual(r["bound"], 3)
+        self.assertFalse(r["stats"]["truncated"])
+        # 续跑访问过多个状态（含 retry/ack 两个起点各自的后续）
+        self.assertGreater(r["stats"]["continuation_states"], 0)
+        self.assertGreater(r["stats"]["continuation_expansions"], 0)
+        self.assertEqual(r["stats"]["continuation_points"], 2)
 
 
 class DiffApiTests(unittest.TestCase):

@@ -1992,7 +1992,7 @@ function renderDiffReport(r) {
                         : "在该步数边界内未发现任何行为差异。"));
   }
   kinds.forEach(k => {
-    const len = witnesses[k].diverge_index ?? witnesses[k].length;
+    const len = witnesses[k].length ?? (witnesses[k].diverge_index);
     tabs.appendChild(el("button", {
       class: "finding-tab " + DIFF_KIND_META[k][1] + (k === diffWitnessKind ? " active" : ""),
       onclick: () => { diffWitnessKind = k; renderDiffReport(r); },
@@ -2007,9 +2007,11 @@ function renderDiffReport(r) {
     ["对齐状态对", s.pairs_visited],
     ["对齐展开", s.aligned_expansions],
     ["轨迹分叉点", s.divergence_points],
+    ["单侧续跑起点", s.continuation_points ?? 0],
+    ["单侧续跑状态", s.continuation_states ?? 0],
     ["对齐终态对", s.terminal_pairs],
     ["最大对齐深度", s.max_depth_reached],
-    ["是否完备", s.truncated ? "否（触及边界）" : "是"],
+    ["是否完备", s.truncated ? "否（触及边界）" : "是（含分叉后续跑）"],
   ].map(([k, v]) => el("span", {}, [k, " ", el("b", {}, String(v))])));
 
   // 默认打开主见证的双列回放
@@ -2059,11 +2061,20 @@ function renderDiffWitnessCard(r, witnesses) {
     });
     card.appendChild(list);
     if (w.via_divergence) {
+      const exhausted = !r.stats?.truncated;
+      const contNote = w.continuation
+        ? `该差异在独有事件之后的单侧续跑中成立：对齐到第 ${w.diverge_index - 1} 步后，
+           ${w.side === "baseline" ? "基线" : "候选"}独有的「${w.event.label}
+           （${w.event.activity || "—"}）」触发轨迹分叉，该侧继续独立推进
+           ${w.continuation_steps} 步（另一侧在分叉点持留）后出现上述变化。`
+        : `⚠ 该差异随轨迹分叉产生：对齐到第 ${w.length - 1} 步后，
+           ${w.side === "baseline" ? "基线" : "候选"}独有的「${w.event.label}
+           （${w.event.activity || "—"}）」造成上述变化，另一侧在该步保持。`;
+      const tailNote = exhausted
+        ? "分叉后的单侧可达状态已在步数上限内枚举完毕（按状态指纹去重）。"
+        : "注意：单侧续跑触及步数/状态上限，分叉之后仍可能有未发现的差异（见上方未完备标注）。";
       card.appendChild(el("div", { class: "finding-detail", style: "margin-top:8px;color:#e8c884" },
-        `⚠ 该差异随轨迹分叉产生：对齐到第 ${w.length - 1} 步后，
-         ${w.side === "baseline" ? "基线" : "候选"}独有的「${w.event.label}
-         （${w.event.activity || "—"}）」造成上述变化，另一侧在该步保持。
-         注意：搜索只证明该分叉点的存在，未穷尽分叉之后的状态空间。`));
+        contNote + tailNote));
     }
     card.appendChild(el("div", { class: "finding-detail", style: "margin-top:8px" },
       "下方双列回放逐对齐步展示两侧快照；差异节点高亮，并可对任意一侧「改选并续跑」做分叉复检。"));
@@ -2114,7 +2125,7 @@ function renderDiffReplay() {
     el("span", { class: "side-pill" }, "候选"),
     el("span", { class: "model-name" }, names.cand));
 
-  renderDiffEventLine(bSteps, cSteps);
+  renderDiffEventLine(bSteps, cSteps, w);
   renderDiffColumn("#diffSnapBase", bSteps[diffIndex], cSteps[diffIndex], "baseline", w);
   renderDiffColumn("#diffSnapCand", cSteps[diffIndex], bSteps[diffIndex], "candidate", w);
   renderDiffChangeAt(bSteps, cSteps);
@@ -2131,7 +2142,7 @@ function diffSideNames() {
   };
 }
 
-function renderDiffEventLine(bSteps, cSteps) {
+function renderDiffEventLine(bSteps, cSteps, w) {
   const wrap = $("#diffEventLine");
   wrap.innerHTML = "";
   const makeSide = (steps, side) => {
@@ -2141,14 +2152,18 @@ function renderDiffEventLine(bSteps, cSteps) {
       if (i === 0) return;
       const e = st.event;
       const held = !!st.hold;
+      const isDivergeStep = w.diverge_index != null && i === w.diverge_index;
+      const holdText = isDivergeStep
+        ? "（另一侧独有事件）"
+        : "（分叉后该侧继续，此侧持留）";
       const chip = el("div", {
         class: "ev-chip" + (i === diffIndex ? " current" : "")
           + (st.diff_point ? " fork-diff" : "") + (held ? " held-chip" : ""),
-        title: held ? "该侧在此对齐步保持（另一侧独有事件）" : (e?.note || e?.label || ""),
+        title: held ? holdText : (e?.note || e?.label || ""),
         onclick: () => { diffIndex = i; renderDiffReplay(); },
       }, held
         ? [el("span", { class: "ev-type" }, `${i}. ⏸ 保持`),
-           el("span", { class: "ev-act" }, "（另一侧独有事件）")]
+           el("span", { class: "ev-act" }, holdText)]
         : [el("span", { class: "ev-type" },
               `${i}. ${shortEventName(e.type, e)}${st.divergence ? " ⤴" : ""}`),
            el("span", { class: "ev-act" },
@@ -2176,7 +2191,10 @@ function renderDiffColumn(sel, step, otherStep, side, w) {
   if (held || diverges) {
     const head = $("#" + (side === "baseline" ? "diffBaseHead" : "diffCandHead"));
     head.appendChild(held
-      ? el("span", { class: "hold-tag" }, "⏸ 保持（另一侧独有事件）")
+      ? el("span", { class: "hold-tag" },
+        (w.diverge_index != null && diffIndex > w.diverge_index)
+          ? "⏸ 持留（另一侧续跑中）"
+          : "⏸ 保持（另一侧独有事件）")
       : el("span", { class: "div-tag" }, "⤴ 独有事件在此触发"));
   }
 
