@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>补偿工作流模型检验台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">⏱</span>
+    <div>
+      <h1>补偿工作流模型检验台</h1>
+      <p class="subtitle">有界显式状态模型检验 · 成功/失败/重试/崩溃恢复/补偿交错枚举 · Z3 可行性分析</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <select id="modelSelect" title="已保存的模型"></select>
+    <button id="btnNew" class="btn">新建</button>
+    <button id="btnExample" class="btn">载入示例 ▾</button>
+    <div id="exampleMenu" class="dropdown-menu hidden"></div>
+    <button id="btnSave" class="btn btn-primary">保存模型</button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- 左：模型编辑 -->
+  <section class="panel panel-editor">
+    <div class="panel-head">
+      <h2>① 模型定义</h2>
+      <div class="head-tools">
+        <input id="modelName" class="input-name" value="未命名模型">
+        <button id="btnValidate" class="btn btn-small">校验</button>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="graph">活动与边</button>
+      <button class="tab" data-tab="vars">变量</button>
+      <button class="tab" data-tab="invariants">不变量</button>
+      <button class="tab" data-tab="concurrency">并发调度</button>
+      <button class="tab" data-tab="risk">随机风险</button>
+      <button class="tab" data-tab="json">JSON</button>
+    </div>
+
+    <div class="tab-body" id="tab-graph">
+      <div class="two-col">
+        <div>
+          <div class="section-title">活动节点
+            <button class="btn btn-small btn-add" id="btnAddActivity">+ 活动</button>
+          </div>
+          <div id="activityList" class="card-list"></div>
+        </div>
+        <div>
+          <div class="section-title">有向边
+            <span class="hint">按顺序匹配第一个「守卫真且前置成立」的出边</span>
+            <button class="btn btn-small btn-add" id="btnAddEdge">+ 边</button>
+          </div>
+          <div id="edgeList" class="card-list"></div>
+          <div class="section-title" style="margin-top:14px">起始活动</div>
+          <select id="startSelect"></select>
+        </div>
+      </div>
+      <div id="graphWrap" class="graph-wrap">
+        <canvas id="graphCanvas" width="900" height="320"></canvas>
+      </div>
+    </div>
+
+    <div class="tab-body hidden" id="tab-vars">
+      <div class="section-title">工作流变量
+        <span class="hint">整数/布尔；可在前置条件、守卫与赋值中引用</span>
+        <button class="btn btn-small btn-add" id="btnAddVar">+ 变量</button>
+      </div>
+      <div id="varList" class="card-list"></div>
+    </div>
+
+    <div class="tab-body hidden" id="tab-invariants">
+      <div class="inv-toggles">
+        <label class="check"><input type="checkbox" id="invOnce" checked>
+          <strong>至多一次生效</strong>
+          <span class="hint">非幂等活动因超时重试/应答丢失而重复产生同一外部效果时被破坏</span>
+        </label>
+        <label class="check"><input type="checkbox" id="invUndo" checked>
+          <strong>失败后最终撤销</strong>
+          <span class="hint">工作流终态为失败且仍有未撤销的外部效果（含补偿动作自身失败）时被破坏</span>
+        </label>
+      </div>
+      <div class="section-title">自定义不变量
+        <span class="hint">支持 succ("id") / effects("key") / undone("key") 与 and/or/not、算术比较</span>
+        <button class="btn btn-small btn-add" id="btnAddInv">+ 不变量</button>
+      </div>
+      <div id="invList" class="card-list"></div>
+    </div>
+
+    <div class="tab-body hidden" id="tab-concurrency">
+      <p class="hint">声明 <strong>fork/join 汇合组</strong>、<strong>共享资源</strong>与<strong>互斥锁</strong>：
+        fork 活动的每条生效出边派生一个并发分支线程，全部到达 join 后汇合；
+        在活动上标注对共享资源的读/写与按序获取的锁。检验器将枚举可运行分支的部分序交错，
+        识别<strong>数据竞态</strong>（无 happens-before 关系且无公共锁保护的冲突访问）、
+        <strong>锁顺序死锁</strong>（等待环）与<strong>无法汇合的分支</strong>。
+        留空（无汇合组）即退回纯串行模型，不影响既有检验。</p>
+
+      <div class="conc-sections">
+        <div>
+          <div class="section-title">fork/join 汇合组
+            <span class="hint">fork 至少需要 2 条出边；join 必须从每个分支可达</span>
+            <button class="btn btn-small btn-add" id="btnAddConcGroup">+ 汇合组</button>
+          </div>
+          <div id="concGroupList" class="conc-list"></div>
+        </div>
+        <div>
+          <div class="section-title">共享资源
+            <span class="hint">在下方活动上标注读 / 写访问</span>
+            <button class="btn btn-small btn-add" id="btnAddResource">+ 资源</button>
+          </div>
+          <div id="concResourceList" class="conc-list"></div>
+        </div>
+        <div>
+          <div class="section-title">互斥锁
+            <span class="hint">活动按列表顺序加锁，成功/失败后自动释放</span>
+            <button class="btn btn-small btn-add" id="btnAddLock">+ 锁</button>
+          </div>
+          <div id="concLockList" class="conc-list"></div>
+        </div>
+        <div>
+          <div class="section-title">活动的并发访问注解</div>
+          <div id="concActivityList" class="conc-list"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-body hidden" id="tab-risk">
+      <p class="hint">为每个活动配置调用与补偿分支的概率。同一<strong>调用分支</strong>五类概率之和必须为 1，
+        同一<strong>补偿分支</strong>概率之和必须为 1；未在活动开关中启用的结果（灰显）概率必须为 0。
+        重调按“每次调用独立掷骰”处理：确认前崩溃恢复后重新调用沿用同一分布；
+        <code>p_ack</code> 为应答丢失后恢复时确认“其实已生效”的概率，
+        <code>p_dup</code> 为重调成功时“首次其实已生效”的条件概率。</p>
+      <div class="risk-tools">
+        <button id="btnRiskUniform" class="btn btn-small">全部置为均衡分布</button>
+        <button id="btnRiskDeterministic" class="btn btn-small">全部重置为确定性成功</button>
+        <span class="hint">仅影响概率配置，不改变模型开关。</span>
+      </div>
+      <div id="riskActivityList" class="card-list"></div>
+    </div>
+
+    <div class="tab-body hidden" id="tab-json">
+      <p class="hint">可直接编辑完整 JSON，切回其他标签时将重新解析。</p>
+      <textarea id="jsonEditor" class="json-editor" spellcheck="false"></textarea>
+    </div>
+
+    <div id="validateBox" class="validate-box"></div>
+  </section>
+
+  <!-- 右：检验与回放 -->
+  <section class="panel panel-check">
+    <div class="panel-head">
+      <h2>② <span id="modeTitle">检验与轨迹回放</span></h2>
+      <div class="head-tools">
+        <div class="mode-switch" id="modeSwitch">
+          <button id="modeCheckBtn" class="mode-btn active">有界检验</button>
+          <button id="modeConcBtn" class="mode-btn">并发调度安全</button>
+          <button id="modeRiskBtn" class="mode-btn">随机风险分析</button>
+          <button id="modeDiffBtn" class="mode-btn">版本行为对比</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 有界检验视图 -->
+    <div id="checkView">
+      <div class="risk-controls">
+        <label class="bound-label">步数上限
+          <input id="boundInput" type="number" min="1" max="80" value="16" class="input-bound">
+        </label>
+        <button id="btnCheck" class="btn btn-primary">开始检验</button>
+      </div>
+
+      <div id="verdictBox" class="verdict-box hidden">
+        <div class="verdict-row">
+          <span id="verdictBadge" class="badge"></span>
+          <span id="verdictText" class="verdict-text"></span>
+        </div>
+        <div id="verdictStats" class="verdict-stats"></div>
+      </div>
+
+    <div id="forkResult" class="fork-result hidden"></div>
+
+    <div id="historyArea" class="history-area">
+      <h3>检验记录</h3>
+      <div id="runHistory" class="run-history"></div>
+    </div>
+    </div><!-- /checkView -->
+
+    <!-- 并发调度安全分析视图 -->
+    <div id="concView" class="hidden">
+      <div class="risk-controls">
+        <label class="bound-label">步数上限
+          <input id="concBoundInput" type="number" min="1" max="80" value="24" class="input-bound">
+        </label>
+        <button id="btnConcRun" class="btn btn-primary">并发调度安全分析</button>
+      </div>
+
+      <div id="concValidationBox" class="validate-box"></div>
+
+      <div id="concReport" class="risk-report hidden">
+        <div class="verdict-row">
+          <span id="concBadge" class="badge"></span>
+          <span id="concVerdictText" class="verdict-text"></span>
+        </div>
+        <div id="concFindingTabs" class="finding-tabs"></div>
+        <div id="concFindingCard"></div>
+        <div id="concStats" class="verdict-stats"></div>
+      </div>
+
+      <div id="concReplayBar" class="risk-replay-bar hidden">
+        <span id="concReplayTitle" class="risk-replay-title"></span>
+        <button id="btnConcBack" class="btn btn-small">◀ 返回分析报告</button>
+      </div>
+
+      <div class="history-area">
+        <h3>并发分析记录</h3>
+        <div id="concRunHistory" class="run-history"></div>
+      </div>
+    </div><!-- /concView -->
+
+    <!-- 随机风险分析视图 -->
+    <div id="riskView" class="hidden">
+      <div class="risk-controls">
+        <label class="bound-label">步数上限
+          <input id="riskBoundInput" type="number" min="1" max="80" value="24" class="input-bound">
+        </label>
+        <label class="bound-label">前 N 条轨迹
+          <input id="riskTopNInput" type="number" min="1" max="50" value="10" class="input-bound">
+        </label>
+        <button id="btnRiskRun" class="btn btn-primary">执行风险分析</button>
+      </div>
+
+      <div id="riskValidationBox" class="validate-box"></div>
+
+      <div id="riskReport" class="risk-report hidden">
+        <div class="verdict-row">
+          <span id="riskBadge" class="badge risk_ok"></span>
+          <span id="riskVerdictText" class="verdict-text"></span>
+        </div>
+
+        <h3 class="risk-h">结局概率分布</h3>
+        <div id="riskDistribution" class="risk-dist"></div>
+        <div id="riskInvariants" class="risk-invariants"></div>
+
+        <h3 class="risk-h">期望未撤销效果（补偿失败导致的永久残留）</h3>
+        <div id="riskExpected" class="risk-expected"></div>
+
+        <h3 class="risk-h">贡献最大的事件轨迹
+          <span class="hint">点击任意行回放；可按列排序，回放中可在任意节点改选结果分叉</span>
+        </h3>
+        <div class="risk-table-wrap">
+          <table class="risk-table">
+            <thead><tr>
+              <th data-sort="rank" class="num">#</th>
+              <th data-sort="probability" class="num">概率 ▾</th>
+              <th data-sort="category">类别</th>
+              <th data-sort="length" class="num">步数</th>
+              <th>事件序列</th>
+            </tr></thead>
+            <tbody id="riskTraceBody"></tbody>
+          </table>
+        </div>
+
+        <div id="riskStats" class="verdict-stats"></div>
+      </div>
+
+      <!-- 风险轨迹回放（复用共享回放组件，由 JS 切换显隐） -->
+      <div id="riskReplayBar" class="risk-replay-bar hidden">
+        <span id="riskReplayTitle" class="risk-replay-title"></span>
+        <button id="btnRiskBack" class="btn btn-small">◀ 返回风险报告</button>
+      </div>
+
+      <div class="history-area">
+        <h3>风险分析记录</h3>
+        <div id="riskRunHistory" class="run-history"></div>
+      </div>
+    </div><!-- /riskView -->
+
+    <!-- 版本行为对比视图 -->
+    <div id="diffView" class="hidden">
+      <p class="hint">选择两个<strong>已保存模型</strong>作为基线与候选（不能相同），设置同一步数上限：
+        系统分别枚举两侧可达状态，按<strong>稳定事件签名</strong>对齐轨迹，区分
+        <strong>终态、变量、外部效果、不变量结论</strong>四类变化以及只在一侧可触发的
+        <strong>轨迹分叉</strong>，给出最短可回放的差异见证。搜索触及边界时会明确标注结果未完备。</p>
+      <div class="risk-controls">
+        <label class="bound-label">基线
+          <select id="diffBaseSelect" class="diff-model-select"></select>
+        </label>
+        <span class="diff-vs">⇄</span>
+        <label class="bound-label">候选
+          <select id="diffCandSelect" class="diff-model-select"></select>
+        </label>
+        <label class="bound-label">步数上限
+          <input id="diffBoundInput" type="number" min="1" max="80" value="16" class="input-bound">
+        </label>
+        <button id="btnDiffRun" class="btn btn-primary">执行版本对比</button>
+      </div>
+      <div id="diffValidationBox" class="validate-box"></div>
+
+      <div id="diffReport" class="risk-report hidden">
+        <div class="verdict-row">
+          <span id="diffBadge" class="badge"></span>
+          <span id="diffVerdictText" class="verdict-text"></span>
+        </div>
+        <div id="diffIncomplete" class="diff-incomplete hidden"></div>
+
+        <div id="diffStructure" class="diff-structure"></div>
+
+        <h3 class="risk-h">差异见证（按最短对齐轨迹、稳定事件序选出）</h3>
+        <div id="diffWitnessTabs" class="finding-tabs"></div>
+        <div id="diffWitnessCard"></div>
+        <div id="diffStats" class="verdict-stats"></div>
+      </div>
+
+      <!-- 双列对齐回放 -->
+      <div id="diffReplayBar" class="risk-replay-bar hidden">
+        <span id="diffReplayTitle" class="risk-replay-title"></span>
+        <button id="btnDiffBack" class="btn btn-small">◀ 返回对比报告</button>
+      </div>
+
+      <div id="diffReplayWrap" class="diff-replay-wrap hidden">
+        <div class="replay-controls">
+          <button id="btnDiffFirst" class="btn btn-small" title="回到起点">⏮</button>
+          <button id="btnDiffPrev" class="btn btn-small" title="上一步">◀</button>
+          <span id="diffStepIndicator" class="step-indicator">0 / 0</span>
+          <button id="btnDiffNext" class="btn btn-small" title="下一步">▶</button>
+          <button id="btnDiffLast" class="btn btn-small" title="到末尾">⏭</button>
+          <input type="range" id="diffStepSlider" min="0" max="0" value="0" class="diff-slider">
+        </div>
+        <div id="diffEventLine" class="diff-event-line"></div>
+        <div class="diff-cols">
+          <div class="diff-col diff-col-base">
+            <div class="diff-col-head" id="diffBaseHead">基线</div>
+            <div id="diffSnapBase" class="diff-snap"></div>
+          </div>
+          <div class="diff-col diff-col-cand">
+            <div class="diff-col-head" id="diffCandHead">候选</div>
+            <div id="diffSnapCand" class="diff-snap"></div>
+          </div>
+        </div>
+        <div id="diffChangeBox" class="diff-change-box"></div>
+      </div>
+
+      <!-- 从差异节点分叉复检（单模型 BFS，复用共享回放组件） -->
+      <div id="diffForkResult" class="fork-result hidden"></div>
+
+      <div class="history-area">
+        <h3>版本对比记录</h3>
+        <div id="diffRunHistory" class="run-history"></div>
+      </div>
+    </div><!-- /diffView -->
+
+    <!-- 共享：单步回放与分叉（有界检验 / 风险轨迹均可使用） -->
+    <div id="replayWrap" class="replay-wrap hidden">
+      <div class="replay-controls">
+        <button id="btnFirst" class="btn btn-small" title="回到起点">⏮</button>
+        <button id="btnPrev" class="btn btn-small" title="上一步">◀</button>
+        <span id="stepIndicator" class="step-indicator">0 / 0</span>
+        <button id="btnNext" class="btn btn-small" title="下一步">▶</button>
+        <button id="btnLast" class="btn btn-small" title="到末尾">⏭</button>
+        <label class="hint" style="margin-left:auto"><input type="checkbox" id="autoPlay"> 自动</label>
+      </div>
+      <div class="step-slider-wrap">
+        <input type="range" id="stepSlider" min="0" max="0" value="0">
+      </div>
+      <div id="eventLine" class="event-line"></div>
+
+      <div class="snapshot-grid">
+        <div class="snap-card">
+          <h3>持久状态</h3>
+          <div class="snap-phase">阶段：<b id="snapPhase"></b></div>
+          <div id="snapActivities" class="snap-list"></div>
+          <h4>变量</h4>
+          <div id="snapVars" class="snap-list"></div>
+        </div>
+        <div class="snap-card">
+          <h3>外部效果（补偿栈）</h3>
+          <div id="snapEffects" class="snap-list"></div>
+          <h4>触发规则 / 守卫判定</h4>
+          <div id="snapRules" class="snap-list rules"></div>
+        </div>
+      </div>
+
+      <div id="violationBox" class="violation-box hidden"></div>
+
+      <div class="fork-area">
+        <h3>③ 在当前节点修改结果后分叉</h3>
+        <p class="hint">列出当前状态下所有可能的交错事件；选择一个与轨迹不同的结果，系统将从该点继续有界检验并对比。</p>
+        <div id="forkOptions" class="fork-options"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
