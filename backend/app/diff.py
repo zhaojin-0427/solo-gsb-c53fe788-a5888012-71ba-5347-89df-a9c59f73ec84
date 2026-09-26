@@ -3,12 +3,20 @@
 做法：对两个工作流分别复用既有串行转移语义（workflow.successors，透明穿过 ε
 转移），从各自初始状态出发做**成对 BFS**：
 
-* 每一层只沿两侧**稳定事件签名 sig 相同**的真实事件对齐展开（sig 即检验器
+* 每一层优先沿两侧**稳定事件签名 sig 相同**的真实事件对齐展开（sig 即检验器
   用于最短反例排序与重放匹配的 `(类型, 活动, 尝试次数)`，见 workflow._event）；
-* 只在一侧可触发的签名产生“轨迹分叉”见证（另一侧无法对齐该事件）；
-* 每个对齐状态对按四类比较：**终态、变量、外部效果、不变量结论**；
+* 只在一侧可触发的签名产生“轨迹分叉”见证（另一侧无法对齐该事件）。分叉**不在
+  识别独有事件后止步**：推进侧在同一步数上限与同一成对状态上限内**继续枚举**
+  其后续可达状态（另一侧在分叉点持留），与对齐展开共用同一个 `(状态指纹对)`
+  去重集合——若分叉后的状态对已被访问（如「确认前崩溃→恢复」无痕迹地回到
+  分叉点），该分支即去重停止，不会把“恢复后照常执行”误报为行为差异；
+* 每个状态对（对齐对 + 分叉后续探对）按四类比较：**终态、变量、外部效果、
+  不变量结论**；分叉后续探发现的差异作为「随轨迹分叉产生」的见证单独标注，
+  例如候选启用非幂等「确认后崩溃」时，应答丢失后的重调、重复生效与
+  「至多一次生效」不变量翻转都会进入报告；
 * BFS 首次发现保证见证的对齐轨迹最短、同长时事件序字典序最小（可回放）；
-* 搜索触及步数边界或状态对安全上限时，结果显式标注「未完备」。
+* 搜索触及步数边界或状态对安全上限时（含单侧续探），结果显式标注「未完备」，
+  不会在仍有未展开分支时声称搜索已完备。
 
 对比使用与「有界检验」完全相同的串行转移系统；声明了 fork/join 汇合组的模型
 在此按其串行结构枚举（不枚举部分序交错），这一约定会写入报告，避免与并发
@@ -75,6 +83,27 @@ class _PNode:
         self.parent = parent
         self.ev_b = ev_b
         self.ev_c = ev_c
+        self.depth = depth
+
+
+class _UNode:
+    """单侧续探节点：对齐到某状态对后，一侧沿其独有事件继续推进、另一侧持留。
+
+    side 为推进侧（"baseline" / "candidate"）；state 为推进侧当前状态；held 为
+    持留侧状态（冻结在分叉点）；origin 为分叉发生的对齐节点；events 为分叉后
+    推进侧已执行的事件序列（首个元素即触发分叉的独有事件）。depth 是全局步数
+    （= origin.depth + len(events)），与对齐节点共用同一步数边界、同一个
+    `(状态指纹对)` 去重集合与同一个 FIFO 队列，因此 BFS 首次发现仍保证
+    全局步数最短、同深度按稳定事件序。
+    """
+    __slots__ = ("side", "state", "held", "origin", "events", "depth")
+
+    def __init__(self, side, state, held, origin, events, depth):
+        self.side = side
+        self.state = state
+        self.held = held
+        self.origin = origin
+        self.events = events
         self.depth = depth
 
 
@@ -257,51 +286,58 @@ def _materialize_state_witness(wf_b: W.Workflow, state0_b: dict,
     }
 
 
-def _materialize_divergence(wf_b: W.Workflow, state0_b: dict,
-                            wf_c: W.Workflow, state0_c: dict,
-                            node: _PNode, side: str,
-                            extra_ev: dict) -> dict:
+def _materialize_one_sided(wf_b: W.Workflow, state0_b: dict,
+                           wf_c: W.Workflow, state0_c: dict,
+                           node: _PNode, side: str,
+                           events: list[dict]) -> dict:
+    """物化单侧见证：对齐前缀之后，推进侧真实重放 events（首个为独有事件），
+    另一侧自分叉点起在每个对齐步「保持」。
+
+    events 是分叉后推进侧的事件序列（>= 1 个；轨迹分叉见证为单事件，分叉后
+    续探发现的四类差异见证可能含多个事件）。物化重放会校验每个事件确实可触发。
+    """
     pairs = _walk_pairs(node)
     events_b = [p[0] for p in pairs]
     events_c = [p[1] for p in pairs]
     steps_b = _side_steps(wf_b, events_b, state0_b, "baseline")
     steps_c = _side_steps(wf_c, events_c, state0_c, "candidate")
     diverge_index = node.depth + 1
-    # 触发侧：真实执行该独有事件（物化时会校验它在该状态确实可触发）
+    # 触发侧：真实执行分叉后的事件序列（more[0] 是分叉点状态，与对齐末步重复）
     if side == "baseline":
-        nxt = C._apply_event(wf_b, node.sb, extra_ev)
-        more_b = C._trace_with_states(wf_b, [extra_ev], node.sb)
-        step = more_b[-1]
-        step["index"] = diverge_index
-        step["align_index"] = diverge_index
-        step["side"] = "baseline"
-        step["divergence"] = True
-        step["diff_point"] = True
-        steps_b.append(step)
-        hold = dict(steps_c[-1])
+        more = C._trace_with_states(wf_b, events, node.sb)
+        moving, holding = steps_b, steps_c
     else:
-        nxt = C._apply_event(wf_c, node.sc, extra_ev)
-        more_c = C._trace_with_states(wf_c, [extra_ev], node.sc)
-        step = more_c[-1]
-        step["index"] = diverge_index
-        step["align_index"] = diverge_index
-        step["side"] = "candidate"
-        step["divergence"] = True
-        step["diff_point"] = True
-        steps_c.append(step)
-        hold = dict(steps_b[-1])
-    # 另一侧：在分叉点保持（hold），不推进
-    hold["index"] = diverge_index
-    hold["align_index"] = diverge_index
-    hold["event"] = None
-    hold["hold"] = True
-    hold["alternatives"] = []
+        more = C._trace_with_states(wf_c, events, node.sc)
+        moving, holding = steps_c, steps_b
     held_side = "candidate" if side == "baseline" else "baseline"
-    hold["side"] = held_side
-    if side == "baseline":
-        steps_c.append(hold)
-    else:
-        steps_b.append(hold)
+    for i, st in enumerate(more[1:]):
+        st["index"] = diverge_index + i
+        st["align_index"] = diverge_index + i
+        st["side"] = side
+        if i == 0:
+            st["divergence"] = True
+        moving.append(st)
+    moving[-1]["diff_point"] = True
+    # 另一侧：自分叉点起逐步保持（hold），不推进
+    base_hold = holding[-1]
+    for i in range(len(events)):
+        hold = dict(base_hold)
+        hold["index"] = diverge_index + i
+        hold["align_index"] = diverge_index + i
+        hold["event"] = None
+        hold["hold"] = True
+        hold["alternatives"] = []
+        hold["side"] = held_side
+        holding.append(hold)
+    first = events[0]
+    side_zh = "基线" if side == "baseline" else "候选"
+    label = first.get("label", first["type"])
+    activity = first.get("activity") or "—"
+    detail = (f"对齐到第 {node.depth} 步后，事件「{label}（{activity}）」只在"
+              f"{side_zh}一侧可触发，另一侧不存在该交错，轨迹在此分叉")
+    if len(events) > 1:
+        detail += (f"；分叉后该侧在同一步数与状态上限内继续推进 "
+                   f"{len(events) - 1} 步（另一侧持留），共 {len(events)} 个单侧事件")
     other_state = node.sc if side == "baseline" else node.sb
     return {
         "kind": KIND_DIVERGENCE,
@@ -309,18 +345,16 @@ def _materialize_divergence(wf_b: W.Workflow, state0_b: dict,
         "length": node.depth,
         "diverge_index": diverge_index,
         "side": side,
-        "event": dict(extra_ev),
-        "sig": list(extra_ev["sig"]),
-        "detail": (f"对齐到第 {node.depth} 步后，事件「{extra_ev.get('label', extra_ev['type'])}"
-                   f"（{extra_ev.get('activity') or '—'}）只在"
-                   + ("基线" if side == "baseline" else "候选")
-                   + "一侧可触发，另一侧不存在该交错，轨迹在此分叉"),
+        "event": dict(first),
+        "sig": list(first["sig"]),
+        "unilateral_events": [list(ev["sig"]) for ev in events],
+        "detail": detail,
         "align_path": [list(p[0]["sig"]) for p in pairs],
         "baseline_steps": steps_b,
         "candidate_steps": steps_c,
         "terminal_after": {"baseline": node.sb.get("outcome"),
                            "candidate": node.sc.get("outcome")},
-        "diverging_terminal": nxt.get("outcome"),
+        "diverging_terminal": moving[-1]["snapshot"].get("outcome"),
         "held_terminal": other_state.get("outcome"),
     }
 
@@ -348,82 +382,128 @@ def run_diff(wf_b: W.Workflow, wf_c: W.Workflow,
             found[kind] = (root, root_changes[kind])
 
     seen = {(W.fingerprint(state0_b), W.fingerprint(state0_c))}
-    queue: deque[_PNode] = deque([root])
+    queue: deque = deque([root])
     # 轨迹分叉：首个分叉（最短、事件序最小）单独保留
     divergence: tuple[_PNode, str, dict] | None = None
-    # 独有事件触发后产生的四类状态变化：每类各自保留最短分叉见证
-    # kind -> (_PNode, side, extra_ev, 变化列表)
-    divergence_kind: dict[str, tuple[_PNode, str, dict, list[dict]]] = {}
+    # 分叉后（含续探）产生的四类状态变化：每类各自保留最短分叉见证
+    # kind -> (分叉点 _PNode, side, 分叉后推进侧事件序列, 变化列表)
+    divergence_kind: dict[str, tuple[_PNode, str, list[dict], list[dict]]] = {}
     pairs_visited = 1
     aligned_expanded = 0
+    unilateral_visited = 0
+    unilateral_expanded = 0
     divergence_count = 0
     terminal_pairs = 0
+    unilateral_terminal = 0
     max_depth = 0
     bound_reached = False
     state_cap_reached = False
 
-    def _post_change(node: _PNode, side: str, extra_ev: dict
-                     ) -> tuple[dict, dict[str, list[dict]]]:
-        """执行单侧独有事件后与另一侧持留状态比较（返回新状态与差异）。"""
-        if side == "baseline":
-            nxt = C._apply_event(wf_b, node.sb, extra_ev)
-            ch = _state_changes(wf_b, nxt, wf_c, node.sc, common_inv)
+    def _compare_unilateral(node: _UNode) -> None:
+        """推进侧当前状态 vs 持留侧状态的四类比较（每类保留最短见证）。"""
+        if node.side == "baseline":
+            ch = _state_changes(wf_b, node.state, wf_c, node.held, common_inv)
         else:
-            nxt = C._apply_event(wf_c, node.sc, extra_ev)
-            ch = _state_changes(wf_b, node.sb, wf_c, nxt, common_inv)
-        return nxt, {k: v for k, v in ch.items() if k in KIND_ORDER}
+            ch = _state_changes(wf_b, node.held, wf_c, node.state, common_inv)
+        for kind in KIND_ORDER:
+            if kind in ch and kind not in divergence_kind:
+                divergence_kind[kind] = (node.origin, node.side,
+                                         node.events, ch[kind])
+
+    def _spawn_unilateral(origin: _PNode, side: str, nxt: dict, ev: dict) -> None:
+        """把一个单侧独有事件入队为续探节点（指纹对去重，与对齐展开共用）。"""
+        nonlocal unilateral_visited, max_depth
+        fp_move = W.fingerprint(nxt)
+        if side == "baseline":
+            key = (fp_move, W.fingerprint(origin.sc))
+            held = origin.sc
+        else:
+            key = (W.fingerprint(origin.sb), fp_move)
+            held = origin.sb
+        if key in seen:
+            return
+        seen.add(key)
+        unilateral_visited += 1
+        child = _UNode(side, nxt, held, origin, [ev], origin.depth + 1)
+        max_depth = max(max_depth, child.depth)
+        _compare_unilateral(child)
+        queue.append(child)
 
     while queue:
         node = queue.popleft()
-        mb = _visible_map(wf_b, node.sb)
-        mc = _visible_map(wf_c, node.sc)
-        if not mb and not mc:
-            terminal_pairs += 1
-            continue
-        if node.depth >= bound:
-            bound_reached = True
-            continue
-        aligned_expanded += 1
 
-        # 共同签名：逐层对齐展开（sorted 保证同深度下字典序最小的先入队）
-        for sig in sorted(set(mb) & set(mc)):
-            nsb, ev_b = mb[sig]
-            nsc, ev_c = mc[sig]
-            key = (W.fingerprint(nsb), W.fingerprint(nsc))
-            if key in seen:
+        if isinstance(node, _UNode):
+            # ---- 单侧续探：推进侧继续枚举后续可达状态，持留侧冻结 ----
+            wf_m = wf_b if node.side == "baseline" else wf_c
+            mm = _visible_map(wf_m, node.state)
+            if not mm:
+                unilateral_terminal += 1
                 continue
-            seen.add(key)
-            pairs_visited += 1
-            child = _PNode(nsb, nsc, node, ev_b, ev_c, node.depth + 1)
-            max_depth = max(max_depth, child.depth)
-            ch = _state_changes(wf_b, nsb, wf_c, nsc, common_inv)
-            for kind in KIND_ORDER:
-                if kind in ch and kind not in found:
-                    found[kind] = (child, ch[kind])
-            queue.append(child)
+            if node.depth >= bound:
+                bound_reached = True
+                continue
+            unilateral_expanded += 1
+            fp_held = W.fingerprint(node.held)
+            for sig in sorted(mm):
+                nxt, ev = mm[sig]
+                fp_move = W.fingerprint(nxt)
+                key = ((fp_move, fp_held) if node.side == "baseline"
+                       else (fp_held, fp_move))
+                if key in seen:
+                    continue
+                seen.add(key)
+                unilateral_visited += 1
+                child = _UNode(node.side, nxt, node.held, node.origin,
+                               node.events + [ev], node.depth + 1)
+                max_depth = max(max_depth, child.depth)
+                _compare_unilateral(child)
+                queue.append(child)
+        else:
+            # ---- 对齐状态对：共同签名对齐展开，单侧签名转入续探 ----
+            mb = _visible_map(wf_b, node.sb)
+            mc = _visible_map(wf_c, node.sc)
+            if not mb and not mc:
+                terminal_pairs += 1
+                continue
+            if node.depth >= bound:
+                bound_reached = True
+                continue
+            aligned_expanded += 1
 
-        # 单侧签名：轨迹分叉。首个分叉作为总见证；每个独有事件执行后与另一侧
-        # 持留状态比较，四类变化分别按“最短、事件序最小”各保留一个分叉见证。
-        only_b = sorted(set(mb) - set(mc))
-        only_c = sorted(set(mc) - set(mb))
-        if only_b or only_c:
-            divergence_count += len(only_b) + len(only_c)
-            if divergence is None:
-                candidates = [(sig, "baseline", mb[sig][1]) for sig in only_b]
-                candidates += [(sig, "candidate", mc[sig][1]) for sig in only_c]
-                candidates.sort(key=lambda x: x[0])
-                sig0, side0, ev0 = candidates[0]
-                divergence = (node, side0, ev0)
-            for sig in only_b:
-                _, pch = _post_change(node, "baseline", mb[sig][1])
-                for kind, changes_here in pch.items():
-                    divergence_kind.setdefault(
-                        kind, (node, "baseline", mb[sig][1], changes_here))
-            for sig in only_c:
-                _, pch = _post_change(node, "candidate", mc[sig][1])
-                for kind, changes_here in pch.items():
-                    divergence_kind.setdefault(
-                        kind, (node, "candidate", mc[sig][1], changes_here))
+            # 共同签名：逐层对齐展开（sorted 保证同深度下字典序最小的先入队）
+            for sig in sorted(set(mb) & set(mc)):
+                nsb, ev_b = mb[sig]
+                nsc, ev_c = mc[sig]
+                key = (W.fingerprint(nsb), W.fingerprint(nsc))
+                if key in seen:
+                    continue
+                seen.add(key)
+                pairs_visited += 1
+                child = _PNode(nsb, nsc, node, ev_b, ev_c, node.depth + 1)
+                max_depth = max(max_depth, child.depth)
+                ch = _state_changes(wf_b, nsb, wf_c, nsc, common_inv)
+                for kind in KIND_ORDER:
+                    if kind in ch and kind not in found:
+                        found[kind] = (child, ch[kind])
+                queue.append(child)
+
+            # 单侧签名：轨迹分叉。首个分叉作为总见证；每个独有事件入队为单侧
+            # 续探节点——后续可达状态（重调、重复生效、不变量翻转等）在同一
+            # 步数/状态上限内继续枚举，不再只执行一步就停止该侧。
+            only_b = sorted(set(mb) - set(mc))
+            only_c = sorted(set(mc) - set(mb))
+            if only_b or only_c:
+                divergence_count += len(only_b) + len(only_c)
+                if divergence is None:
+                    candidates = [(sig, "baseline", mb[sig][1]) for sig in only_b]
+                    candidates += [(sig, "candidate", mc[sig][1]) for sig in only_c]
+                    candidates.sort(key=lambda x: x[0])
+                    sig0, side0, ev0 = candidates[0]
+                    divergence = (node, side0, ev0)
+                for sig in only_b:
+                    _spawn_unilateral(node, "baseline", *mb[sig])
+                for sig in only_c:
+                    _spawn_unilateral(node, "candidate", *mc[sig])
 
         if len(seen) > STATE_CAP:
             state_cap_reached = True
@@ -436,23 +516,23 @@ def run_diff(wf_b: W.Workflow, wf_c: W.Workflow,
     for kind, (node, changes_here) in found.items():
         witnesses[kind] = _materialize_state_witness(
             wf_b, state0_b, wf_c, state0_c, node, kind, changes_here)
-    # 分叉产生的变化只在对齐展开找不到该类见证时补充（对齐见证优先）
-    for kind, (node, side, ev, changes_here) in divergence_kind.items():
+    # 分叉（含续探）产生的变化只在对齐展开找不到该类见证时补充（对齐见证优先）
+    for kind, (origin, side, events, changes_here) in divergence_kind.items():
         if kind in found:
             continue
-        w = _materialize_divergence(
-            wf_b, state0_b, wf_c, state0_c, node, side, ev)
+        w = _materialize_one_sided(
+            wf_b, state0_b, wf_c, state0_c, origin, side, events)
         w["kind"] = kind
         w["kind_label"] = KIND_LABELS[kind] + "（随轨迹分叉产生；见证为该分叉）"
         w["changes"] = changes_here
         w["via_divergence"] = True
-        w["length"] = node.depth + 1
+        w["length"] = origin.depth + len(events)
         witnesses[kind] = w
     divergence_witness = None
     if divergence is not None:
         dnode, side, ev = divergence
-        divergence_witness = _materialize_divergence(
-            wf_b, state0_b, wf_c, state0_c, dnode, side, ev)
+        divergence_witness = _materialize_one_sided(
+            wf_b, state0_b, wf_c, state0_c, dnode, side, [ev])
 
     primary_kind = next((k for k in KIND_ORDER if k in witnesses), None)
     has_diff = bool(found) or bool(divergence_kind) or divergence_witness is not None
@@ -486,6 +566,9 @@ def run_diff(wf_b: W.Workflow, wf_c: W.Workflow,
     stats = {
         "pairs_visited": pairs_visited,
         "aligned_expansions": aligned_expanded,
+        "unilateral_visited": unilateral_visited,
+        "unilateral_expansions": unilateral_expanded,
+        "unilateral_terminal": unilateral_terminal,
         "divergence_points": divergence_count,
         "terminal_pairs": terminal_pairs,
         "max_depth_reached": max_depth,
@@ -496,7 +579,7 @@ def run_diff(wf_b: W.Workflow, wf_c: W.Workflow,
     }
     return {
         "verdict": verdict,
-        "verdict_text": _verdict_text(verdict, found, divergence_witness, bound,
+        "verdict_text": _verdict_text(verdict, witnesses, divergence_witness, bound,
                                      incompleteness),
         "bound": bound,
         "stats": stats,
@@ -506,9 +589,10 @@ def run_diff(wf_b: W.Workflow, wf_c: W.Workflow,
         "divergence": divergence_witness,
         "structure": structure,
         "invariant_config_diff": invariant_config,
-        "semantics_note": "对比复用有界检验的串行转移语义（按稳定事件签名对齐）；"
-                          "声明了 fork/join 汇合组的模型不枚举部分序并发交错，"
-                          "并发行为差异请以「并发调度安全」分析为准。",
+        "semantics_note": "对比复用有界检验的串行转移语义（按稳定事件签名对齐；"
+                          "单侧独有事件分叉后，推进侧在同一步数/状态上限内继续枚举，"
+                          "另一侧持留）；声明了 fork/join 汇合组的模型不枚举部分序"
+                          "并发交错，并发行为差异请以「并发调度安全」分析为准。",
         "initial_snapshots": {
             "baseline": C.snapshot(wf_b, state0_b),
             "candidate": C.snapshot(wf_c, state0_c),
@@ -516,20 +600,22 @@ def run_diff(wf_b: W.Workflow, wf_c: W.Workflow,
     }
 
 
-def _verdict_text(verdict: str, found: dict, divergence: dict | None,
+def _verdict_text(verdict: str, witnesses: dict, divergence: dict | None,
                   bound: int, incompleteness: list[str]) -> str:
     kinds = []
     for k in KIND_ORDER:
-        if k in found:
+        if k in witnesses:
             kinds.append(KIND_LABELS[k])
     if divergence is not None:
         kinds.append(KIND_LABELS[KIND_DIVERGENCE])
     if verdict == "identical":
         return (f"在同一步数上限 {bound} 内，基线与候选的可达状态按稳定事件签名逐一对齐，"
+                "两侧独有事件后的可达状态亦已分别枚举（按状态指纹对去重），"
                 "终态、变量、外部效果与共同启用的不变量结论均无差异，且搜索已穷尽边界内"
-                "全部对齐状态。该结论仅在该步数边界内成立。")
+                "全部对齐与单侧续探状态。该结论仅在该步数边界内成立。")
     head = ("发现版本行为差异：" + "、".join(kinds) + "。"
-            "每类差异均给出按最短对齐轨迹、稳定事件序选出的可回放见证。")
+            "每类差异均给出按最短对齐轨迹、稳定事件序选出的可回放见证；"
+            "随轨迹分叉产生的差异已包含分叉后单侧续探到达的状态。")
     if verdict == "diff_found_incomplete":
         head += "⚠ 但搜索触及边界，" + "；".join(incompleteness)
     elif verdict == "inconclusive":

@@ -286,7 +286,9 @@
       <p class="hint">选择两个<strong>已保存模型</strong>作为基线与候选（不能相同），设置同一步数上限：
         系统分别枚举两侧可达状态，按<strong>稳定事件签名</strong>对齐轨迹，区分
         <strong>终态、变量、外部效果、不变量结论</strong>四类变化以及只在一侧可触发的
-        <strong>轨迹分叉</strong>，给出最短可回放的差异见证。搜索触及边界时会明确标注结果未完备。</p>
+        <strong>轨迹分叉</strong>；分叉后推进侧在同一步数与状态上限内<strong>继续枚举后续可达状态</strong>
+        （另一侧保持、按状态指纹对去重），后续重调、重复生效与不变量变化一并进入报告，
+        给出最短可回放的差异见证。搜索触及边界时会明确标注结果未完备。</p>
       <div class="risk-controls">
         <label class="bound-label">基线
           <select id="diffBaseSelect" class="diff-model-select"></select>

@@ -9,6 +9,10 @@
 * 共同自定义不变量的结论翻转 -> invariant 见证；仅一侧启用的不变量进入配置差异；
 * 步数边界截断 -> inconclusive 且 incompleteness 非空（结果未完备标注）；
 * 见证步骤的对齐索引连续、两侧长度在分叉步对齐；
+* 单侧续探：候选启用非幂等「确认后崩溃」时，分叉后的重调、重复生效与
+  「至多一次生效」不变量翻转随续探进入报告（不再只执行独有事件一步就停止）；
+  续探在同一步数/状态上限内枚举，触界即标注未完备；「确认前崩溃→恢复」无痕迹
+  回到分叉点时按指纹对去重停止，不产生伪差异；
 * 从差异节点分叉复检（/api/diff/fork）、对比记录持久化、按记录打开（含快照）；
 * 同模型对比返回 400；既有检验/风险/并发 API 不受影响。
 """
@@ -218,6 +222,108 @@ class DiffCoreTests(unittest.TestCase):
         self.assertTrue(r["stats"]["truncated"])
 
 
+class DiffUnilateralContinuationTests(unittest.TestCase):
+    """单侧独有事件后的续探：后续重调、重复生效与不变量变化必须进入报告，
+    且续探受同一步数/状态上限约束并如实标注未完备。"""
+
+    @staticmethod
+    def _post_crash_specs():
+        """基线 pay 无确认后崩溃；候选 pay 启用非幂等确认后崩溃（应答丢失）。"""
+        base = _spec(start="pay", activities=[
+            _act("pay", effect="accountCharged", idempotent=False),
+            _act("ship", effect="shipNotified", idempotent=True),
+        ], edges=[{"src": "pay", "dst": "ship"}])
+        cand = _spec(start="pay", activities=[
+            _act("pay", effect="accountCharged", idempotent=False,
+                 post_crash=True),
+            _act("ship", effect="shipNotified", idempotent=True),
+        ], edges=[{"src": "pay", "dst": "ship"}])
+        return base, cand
+
+    def test_post_crash_continuation_reaches_duplicate_and_invariant(self):
+        base, cand = self._post_crash_specs()
+        r = D.run_diff(W.compile_workflow(base), W.compile_workflow(cand),
+                       bound=16)
+        self.assertEqual(r["verdict"], "diff_found")
+        # 关键回归：候选应答丢失后重调并重复生效 -> 「至多一次生效」在候选被破坏，
+        # 该不变量结论变化必须进入报告（修复前分叉后只执行一步，永远漏检）。
+        self.assertIn("invariant", r["witnesses"])
+        w = r["witnesses"]["invariant"]
+        self.assertTrue(w.get("via_divergence"))
+        # 分叉（retry 应答丢失）之后还需再推进（retry_timeout_duplicate）才到达
+        self.assertEqual(w["diverge_index"], 1)
+        self.assertEqual(w["length"], 2)
+        self.assertEqual([e[0] for e in w["unilateral_events"]],
+                         ["retry", "retry_timeout_duplicate"])
+        ch = w["changes"][0]
+        self.assertEqual(ch["id"], "at_most_once")
+        self.assertEqual((ch["base_violated"], ch["candidate_violated"]),
+                         (False, True))
+        # 见证可双列回放：分叉步后候选继续推进、基线逐步保持，对齐索引连续
+        self.assertEqual(w["candidate_steps"][1]["event"]["type"], "retry")
+        self.assertEqual(w["candidate_steps"][2]["event"]["type"],
+                         "retry_timeout_duplicate")
+        self.assertTrue(w["candidate_steps"][1]["divergence"])
+        self.assertTrue(w["candidate_steps"][-1]["diff_point"])
+        self.assertTrue(w["baseline_steps"][-1]["hold"])
+        n = len(w["candidate_steps"])
+        self.assertEqual(len(w["baseline_steps"]), n)
+        self.assertEqual([s["align_index"] for s in w["candidate_steps"]],
+                         list(range(n)))
+        self.assertEqual([s["align_index"] for s in w["baseline_steps"]],
+                         list(range(n)))
+        # 末步候选侧确有两条生效记录且后者标记重复
+        last_effects = w["candidate_steps"][-1]["snapshot"]["effects"]
+        self.assertEqual(len(last_effects), 2)
+        self.assertTrue(last_effects[-1]["duplicate"])
+        # 重复生效的外部效果变化同样进入报告
+        self.assertIn("effects", r["witnesses"])
+        # 续探在边界内穷尽 -> 不标注未完备（此时「完备」才是准确结论）
+        self.assertFalse(r["stats"]["truncated"])
+        self.assertEqual(r["incompleteness"], [])
+        self.assertGreater(r["stats"]["unilateral_visited"], 0)
+
+    def test_unilateral_continuation_respects_bound_and_marks_incomplete(self):
+        # 基线：a 成功后结束；候选：a 可应答丢失，且成功后进入 b->c->b 增长环。
+        # 对齐部分有限，但分叉后的单侧续探在步数边界处被截断 -> 必须标注未完备
+        # （修复前续探不存在，报告会错误地显示搜索已完备）。
+        base = _spec(
+            variables=[{"name": "v", "type": "int", "initial": 0}],
+            activities=[_act("a", effect="e1")])
+        cand = _spec(
+            variables=[{"name": "v", "type": "int", "initial": 0}],
+            activities=[
+                _act("a", effect="e1", post_crash=True),
+                _act("b", assign=[{"var": "v", "expr": "v + 1"}]),
+                _act("c"),
+            ],
+            edges=[{"src": "a", "dst": "b"}, {"src": "b", "dst": "c"},
+                   {"src": "c", "dst": "b"}])
+        r = D.run_diff(W.compile_workflow(base), W.compile_workflow(cand),
+                       bound=6)
+        self.assertEqual(r["verdict"], "diff_found_incomplete")
+        self.assertTrue(r["stats"]["truncated"])
+        self.assertTrue(r["stats"]["bound_reached"])
+        self.assertTrue(any("步数边界" in t for t in r["incompleteness"]))
+        # 边界内已发现的差异（候选仍在运行 vs 基线已成功）照常报告
+        self.assertIn("terminal", r["witnesses"])
+
+    def test_pre_crash_recover_resync_yields_no_spurious_changes(self):
+        # 候选 a 多了确认前崩溃；崩溃→恢复无持久痕迹地回到分叉点状态，
+        # 续探按指纹对去重后立即停止，不应把「恢复后照常执行」报成行为差异。
+        base = _spec(activities=[_act("a", effect="e1")])
+        cand = _spec(activities=[_act("a", effect="e1", pre_crash=True)])
+        r = D.run_diff(W.compile_workflow(base), W.compile_workflow(cand),
+                       bound=10)
+        self.assertEqual(r["verdict"], "diff_found")  # 分叉本身仍报告
+        self.assertIsNotNone(r["divergence"])
+        self.assertEqual(r["divergence"]["event"]["type"], "crash_before_ack")
+        # 四类差异都不应出现（恢复后状态与分叉点指纹重合，续探去重停止）
+        self.assertEqual(r["witnesses"], {})
+        self.assertFalse(r["stats"]["truncated"])
+        self.assertGreater(r["stats"]["unilateral_visited"], 0)
+
+
 class DiffApiTests(unittest.TestCase):
     """HTTP 层：执行、持久化、分叉复检、按记录打开与既有 API 共存。"""
 
@@ -284,6 +390,34 @@ class DiffApiTests(unittest.TestCase):
             "side": "candidate", "prefix": [],
             "sig": ["success", "a", 1], "bound": 12}).json()
         self.assertIn(fk2["verdict"], ("violated", "exhausted", "bound_reached"))
+
+    def test_post_crash_continuation_over_http(self):
+        # HTTP 端到端：候选启用非幂等确认后崩溃，续探发现的不变量翻转进入
+        # 报告与持久化记录；统计包含单侧续探计数。
+        c = type(self).client
+        base_spec = _chain()
+        cand_spec = _chain()
+        cand_spec["activities"][0].update(post_crash=True, idempotent=False)
+        base = c.post("/api/models",
+                      json={"name": "http基线", "spec": base_spec}).json()
+        cand = c.post("/api/models",
+                      json={"name": "http候选", "spec": cand_spec}).json()
+        r = c.post("/api/diff", json={
+            "baseline_id": base["id"], "candidate_id": cand["id"],
+            "bound": 14, "persist": True}).json()
+        self.assertEqual(r["verdict"], "diff_found")
+        self.assertIn("invariant", r["witnesses"])
+        w = r["witnesses"]["invariant"]
+        self.assertTrue(w["via_divergence"])
+        self.assertEqual(w["changes"][0]["id"], "at_most_once")
+        self.assertEqual(w["changes"][0]["candidate_violated"], True)
+        self.assertGreater(r["stats"]["unilateral_visited"], 0)
+        self.assertFalse(r["stats"]["truncated"])
+        # 持久化记录按原样可读（含续探见证与两侧快照）
+        full = c.get(f"/api/diff/runs/{r['run_id']}").json()
+        self.assertIn("invariant", full["result"]["witnesses"])
+        self.assertEqual(full["result"]["witnesses"]["invariant"]
+                         ["unilateral_events"][0][0], "retry")
 
     def test_same_model_rejected(self):
         c = type(self).client

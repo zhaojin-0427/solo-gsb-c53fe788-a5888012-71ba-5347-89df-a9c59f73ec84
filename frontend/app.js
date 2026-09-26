@@ -1992,7 +1992,11 @@ function renderDiffReport(r) {
                         : "在该步数边界内未发现任何行为差异。"));
   }
   kinds.forEach(k => {
-    const len = witnesses[k].diverge_index ?? witnesses[k].length;
+    const w0 = witnesses[k];
+    // 轨迹分叉页签显示分叉发生的对齐步；四类差异页签显示完整见证长度
+    // （随分叉产生的见证 = 对齐前缀 + 分叉后单侧续探步数）
+    const len = (k === "divergence") ? (w0.diverge_index ?? w0.length)
+                                     : (w0.length ?? w0.diverge_index);
     tabs.appendChild(el("button", {
       class: "finding-tab " + DIFF_KIND_META[k][1] + (k === diffWitnessKind ? " active" : ""),
       onclick: () => { diffWitnessKind = k; renderDiffReport(r); },
@@ -2006,9 +2010,11 @@ function renderDiffReport(r) {
     ["步数边界", r.bound],
     ["对齐状态对", s.pairs_visited],
     ["对齐展开", s.aligned_expansions],
+    ["单侧续探状态", s.unilateral_visited ?? 0],
+    ["单侧续探展开", s.unilateral_expansions ?? 0],
     ["轨迹分叉点", s.divergence_points],
     ["对齐终态对", s.terminal_pairs],
-    ["最大对齐深度", s.max_depth_reached],
+    ["最大探索深度", s.max_depth_reached],
     ["是否完备", s.truncated ? "否（触及边界）" : "是"],
   ].map(([k, v]) => el("span", {}, [k, " ", el("b", {}, String(v))])));
 
@@ -2027,10 +2033,15 @@ function renderDiffWitnessCard(r, witnesses) {
   const w = witnesses[diffWitnessKind];
   const cls = DIFF_KIND_META[diffWitnessKind][1];
   const card = el("div", { class: "finding-card " + cls });
+  const headHint = (diffWitnessKind === "divergence")
+    ? `最短对齐轨迹 ${w.length} 步后分叉（按稳定事件签名对齐、字典序最小）`
+    : (w.via_divergence
+        ? `最短见证 ${w.length} 步（对齐 ${w.diverge_index - 1} 步 + 分叉后单侧续探 `
+          + `${w.length - w.diverge_index + 1} 步）`
+        : `最短对齐轨迹 ${w.length} 步（按稳定事件签名对齐、字典序最小）`);
   card.appendChild(el("div", { class: "finding-head" }, [
     el("span", { class: "finding-title" }, DIFF_KIND_META[diffWitnessKind][0]),
-    el("span", { class: "hint" },
-      `最短对齐轨迹 ${w.length} 步（按稳定事件签名对齐、字典序最小）`),
+    el("span", { class: "hint" }, headHint),
     el("button", { class: "btn btn-small", style: "margin-left:auto",
       onclick: () => openDiffWitness(w, diffWitnessKind) }, "▶ 回放该见证"),
   ]));
@@ -2059,11 +2070,14 @@ function renderDiffWitnessCard(r, witnesses) {
     });
     card.appendChild(list);
     if (w.via_divergence) {
+      const sideZh2 = w.side === "baseline" ? "基线" : "候选";
+      const cont = w.length - (w.diverge_index ?? w.length) + 1;
       card.appendChild(el("div", { class: "finding-detail", style: "margin-top:8px;color:#e8c884" },
-        `⚠ 该差异随轨迹分叉产生：对齐到第 ${w.length - 1} 步后，
-         ${w.side === "baseline" ? "基线" : "候选"}独有的「${w.event.label}
-         （${w.event.activity || "—"}）」造成上述变化，另一侧在该步保持。
-         注意：搜索只证明该分叉点的存在，未穷尽分叉之后的状态空间。`));
+        `⚠ 该差异随轨迹分叉产生：对齐到第 ${w.diverge_index - 1} 步后，
+         ${sideZh2}独有的「${w.event.label}（${w.event.activity || "—"}）」使轨迹分叉；
+         分叉后该侧在同一步数与状态上限内继续枚举（另一侧逐步保持，
+         按状态指纹对去重），再推进 ${cont} 步到达上述差异。
+         若续探触及边界，报告顶部会标注「结果未完备」。`));
     }
     card.appendChild(el("div", { class: "finding-detail", style: "margin-top:8px" },
       "下方双列回放逐对齐步展示两侧快照；差异节点高亮，并可对任意一侧「改选并续跑」做分叉复检。"));
@@ -2081,8 +2095,11 @@ function openDiffWitness(w, kind) {
   $("#diffReplayWrap").classList.remove("hidden");
   $("#diffReport").classList.remove("hidden");
   const maxI = Math.max(w.baseline_steps.length, w.candidate_steps.length) - 1;
-  // 分叉类见证（含随分叉产生的别名差异）定位到独有事件步
-  diffIndex = (w.diverge_index != null) ? w.diverge_index : w.length;
+  // 轨迹分叉见证定位到独有事件步；四类差异见证定位到差异点
+  // （随分叉产生的见证：分叉后单侧续探的末步）
+  diffIndex = (kind === "divergence" && w.diverge_index != null)
+    ? w.diverge_index
+    : (w.length ?? w.diverge_index ?? maxI);
   $("#diffStepSlider").max = maxI;
   renderDiffReplay();
   $("#diffReplayWrap").scrollIntoView({ behavior: "smooth", block: "start" });
